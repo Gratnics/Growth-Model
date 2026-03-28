@@ -34,9 +34,9 @@ class Config:
                                 n_layers=6, n_heads=16, n_kv_heads=8,
                                 ffn_mult=4, dropout=0.0, bias=False)
     CHILD  = DEFAULT_CHILD
-    BASELINE = ModelConfig(vocab_size=50257, max_seq_len=256, d_model=410,
-                           n_layers=6, n_heads=5, n_kv_heads=5,
-                           ffn_mult=4, dropout=0.0, bias=False)
+    BASELINE = None
+    BASELINE_TARGET_PARAMS_M = None
+    BASELINE_ESTIMATED_PARAMS_M = None
     DEFAULT_NEXT_CHILD = ModelConfig(vocab_size=50257, max_seq_len=256, d_model=640,
                                      n_layers=6, n_heads=20, n_kv_heads=10,
                                      ffn_mult=4, dropout=0.0, bias=False)
@@ -62,7 +62,7 @@ class Config:
     CHILD_DIR   = "./checkpoints/child_layers"
     CHILD_FT_PATH = "./checkpoints/child_finetuned.pt"
     CHILD_CONFIG_PATH = "./checkpoints/child_config.json"
-    BASELINE_PATH = "./checkpoints/scratch_baseline_32m.pt"
+    BASELINE_PATH = "./checkpoints/same_arch_baseline_32m.pt"
     NEXT_CHILD_DIR = "./checkpoints/next_child_layers"
     NEXT_CHILD_FT_PATH = "./checkpoints/next_child_finetuned.pt"
     NEXT_CHILD_GROWTH_FACTOR = 1.25
@@ -233,9 +233,17 @@ def derive_next_child_config(child_config):
     )
 
 
+def refresh_runtime_baseline_config():
+    target_params = estimate_growth_model_params(Config.PARENT, Config.CHILD)
+    Config.BASELINE = model_config_from_dict(model_config_to_dict(Config.CHILD))
+    Config.BASELINE_TARGET_PARAMS_M = target_params
+    Config.BASELINE_ESTIMATED_PARAMS_M = target_params
+
+
 def apply_runtime_child_config(child_config, persist=False):
     Config.CHILD = child_config
     Config.NEXT_CHILD = derive_next_child_config(child_config)
+    refresh_runtime_baseline_config()
     if persist:
         os.makedirs(Config.CKPT_DIR, exist_ok=True)
         with open(Config.CHILD_CONFIG_PATH, "w", encoding="utf-8") as f:
@@ -247,6 +255,21 @@ def load_saved_child_config():
         return None
     with open(Config.CHILD_CONFIG_PATH, "r", encoding="utf-8") as f:
         return model_config_from_dict(json.load(f))
+
+
+refresh_runtime_baseline_config()
+
+
+def baseline_model_label():
+    return f"Same-architecture scratch baseline (~{Config.BASELINE_ESTIMATED_PARAMS_M:.1f}M)"
+
+
+def baseline_metadata():
+    return {
+        "architecture": "same_arch_scratch_baseline",
+        "parent_config": model_config_to_dict(Config.PARENT),
+        "internal_config": model_config_to_dict(Config.BASELINE),
+    }
 
 
 def parse_child_growth_input(raw_value):
@@ -458,14 +481,16 @@ WORKFLOW_MENU = {
 
 
 def print_banner():
+    child_params = estimate_growth_model_params(Config.PARENT, Config.CHILD)
     print("\nGrowth Model - Validation Experiment (Revised)")
     print(f"  Device   : {Config.DEVICE}")
     if torch.cuda.is_available():
         print(f"  GPU      : {torch.cuda.get_device_name(0)}")
-        print(f"  VRAM     : {torch.cuda.get_device_properties(0).total_memory/1024**3:.1f} GB")
+    print(f"  VRAM     : {torch.cuda.get_device_properties(0).total_memory/1024**3:.1f} GB")
     print(f"  Parent   : d_model={Config.PARENT.d_model}, n_layers={Config.PARENT.n_layers}")
-    print(f"  Child    : d_model={Config.CHILD.d_model},  n_layers={Config.CHILD.n_layers}")
-    print(f"  Scratch  : d_model={Config.BASELINE.d_model}, n_layers={Config.BASELINE.n_layers}")
+    print(f"  Child    : d_model={Config.CHILD.d_model},  n_layers={Config.CHILD.n_layers} (~{child_params:.1f}M)")
+    print(f"  Baseline : interface={Config.PARENT.d_model}, internal={Config.BASELINE.d_model}, "
+          f"n_layers={Config.BASELINE.n_layers} (~{Config.BASELINE_ESTIMATED_PARAMS_M:.1f}M)")
     print(f"  Next     : d_model={Config.NEXT_CHILD.d_model}, n_layers={Config.NEXT_CHILD.n_layers}")
 
 
@@ -487,6 +512,8 @@ def select_start_mode():
 
 
 def resolve_mode(mode):
+    if mode == "standard32m":
+        return "baseline"
     if mode == "menu":
         return select_start_mode()
     return mode
@@ -923,6 +950,70 @@ def run_spawn_from_teacher(label, teacher_model, cache_dir, target_config, layer
 
 # Child / Next Child
 
+def init_decoder_like_my_model(module):
+    if isinstance(module, nn.Linear):
+        nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.Embedding):
+        nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    elif isinstance(module, RMSNorm):
+        nn.init.ones_(module.weight)
+
+
+class ScratchChildModel(nn.Module):
+    def __init__(self, parent_config, internal_config):
+        super().__init__()
+        if internal_config.n_layers != parent_config.n_layers:
+            raise ValueError(
+                "ScratchChildModel expects the parent interface depth and child internal depth to match."
+            )
+
+        self.parent_config = parent_config
+        self.internal_config = internal_config
+        interface_dim = parent_config.d_model
+        internal_dim = internal_config.d_model
+
+        self.tok_emb = nn.Embedding(parent_config.vocab_size, interface_dim)
+        self.norm_out = RMSNorm(interface_dim)
+        self.lm_head = nn.Linear(interface_dim, parent_config.vocab_size, bias=False)
+        self.lm_head.weight = self.tok_emb.weight
+        self.blocks = nn.ModuleList([
+            TransformerBlock(internal_config)
+            for _ in range(parent_config.n_layers)
+        ])
+        self.proj_ups = nn.ModuleList([
+            nn.Linear(interface_dim, internal_dim, bias=False)
+            for _ in range(parent_config.n_layers)
+        ])
+        self.proj_downs = nn.ModuleList([
+            nn.Linear(internal_dim, interface_dim, bias=False)
+            for _ in range(parent_config.n_layers)
+        ])
+
+        self.apply(init_decoder_like_my_model)
+
+        for name, param in self.named_parameters():
+            if name.endswith("out_proj.weight") or name.endswith("down_proj.weight"):
+                nn.init.normal_(param, mean=0.0, std=0.02 / math.sqrt(2 * parent_config.n_layers))
+
+    def count_params(self):
+        return sum(p.numel() for p in self.parameters()) / 1e6
+
+    def forward(self, input_ids, labels=None):
+        x = self.tok_emb(input_ids)
+        for layer_idx in range(len(self.blocks)):
+            x = layer_forward(self, layer_idx, x)
+        x = self.norm_out(x)
+        logits = self.lm_head(x)
+        loss = None
+        if labels is not None:
+            sl = logits[:, :-1, :].contiguous()
+            tl = labels[:, 1:].contiguous()
+            loss = F.cross_entropy(sl.view(-1, sl.size(-1)), tl.view(-1))
+        return loss, logits
+
+
 class LayerGrowthModel(nn.Module):
     def __init__(self, parent, internal_config, layer_dir, copy_parent_norm=False):
         super().__init__()
@@ -1034,8 +1125,11 @@ def run_finetune_for_model(
     epochs=Config.FINETUNE_EPOCHS,
     lr=Config.LR_FINETUNE,
     checkpoint_artifact="finetuned_checkpoint",
+    model_config=None,
+    extra_metadata=None,
+    stage_label="Fine-tuning",
 ):
-    print("\n" + "="*55 + f"\n  Fine-tuning: {model_label}\n" + "="*55)
+    print("\n" + "="*55 + f"\n  {stage_label}: {model_label}\n" + "="*55)
     device = Config.DEVICE
     model = model.to(device)
     model.train()
@@ -1083,17 +1177,22 @@ def run_finetune_for_model(
                 row["val_ppl"] = val_ppl
 
     torch.save(model.state_dict(), save_path)
+    metadata = {
+        **runtime_dataset_metadata(),
+        "artifact": checkpoint_artifact,
+        "model_label": model_label,
+    }
+    if model_config is not None:
+        metadata["model_config"] = model_config_to_dict(model_config)
+    if extra_metadata is not None:
+        metadata.update(extra_metadata)
     save_metadata(
         checkpoint_metadata_path(save_path),
-        {
-            **runtime_dataset_metadata(),
-            "artifact": checkpoint_artifact,
-            "model_label": model_label,
-        },
+        metadata,
     )
     save_csv(os.path.join(Config.RESULTS_DIR, result_csv), log_rows)
     save_csv(os.path.join(Config.RESULTS_DIR, epoch_result_csv), epoch_rows)
-    print(f"\nSaved fine-tuned model: {save_path}")
+    print(f"\nSaved model: {save_path}")
 
 def run_finetune(data_cache):
     device = Config.DEVICE
@@ -1107,23 +1206,31 @@ def run_finetune(data_cache):
         result_csv="finetune_log.csv",
         epoch_result_csv="finetune_epoch_metrics.csv",
         checkpoint_artifact="child_finetuned_checkpoint",
+        model_config=Config.CHILD,
+    )
+
+
+def run_standard_baseline(data_cache):
+    device = Config.DEVICE
+    baseline = ScratchChildModel(Config.PARENT, Config.BASELINE).to(device)
+    run_finetune_for_model(
+        data_cache=data_cache,
+        model=baseline,
+        model_label=baseline_model_label(),
+        save_path=Config.BASELINE_PATH,
+        result_csv="same_arch_baseline_log.csv",
+        epoch_result_csv="same_arch_baseline_epoch_metrics.csv",
+        epochs=Config.BASELINE_EPOCHS,
+        lr=Config.LR_FINETUNE,
+        checkpoint_artifact="same_arch_baseline_checkpoint",
+        model_config=Config.BASELINE,
+        extra_metadata=baseline_metadata(),
+        stage_label="Standard training",
     )
 
 
 def run_scratch_baseline(data_cache):
-    device = Config.DEVICE
-    baseline = MyModel(Config.BASELINE).to(device)
-    run_finetune_for_model(
-        data_cache=data_cache,
-        model=baseline,
-        model_label="Scratch baseline (~32.1M, no Spawn)",
-        save_path=Config.BASELINE_PATH,
-        result_csv="scratch_baseline_log.csv",
-        epoch_result_csv="scratch_baseline_epoch_metrics.csv",
-        epochs=Config.BASELINE_EPOCHS,
-        lr=Config.LR_FINETUNE,
-        checkpoint_artifact="scratch_baseline_checkpoint",
-    )
+    run_standard_baseline(data_cache)
 
 
 def run_next_cache(data_cache):
@@ -1175,13 +1282,14 @@ def run_next_finetune(data_cache):
         result_csv="next_finetune_log.csv",
         epoch_result_csv="next_finetune_epoch_metrics.csv",
         checkpoint_artifact="next_child_finetuned_checkpoint",
+        model_config=Config.NEXT_CHILD,
     )
 
 
 # Eval
 
 def run_eval(data_cache):
-    print("\n" + "="*55 + "\n  Step 5: Evaluation (3-model comparison)\n" + "="*55)
+    print("\n" + "="*55 + "\n  Step 5: Evaluation (comparison)\n" + "="*55)
     device = Config.DEVICE
 
     parent = load_base_parent(device)
@@ -1204,24 +1312,31 @@ def run_eval(data_cache):
         child_ft.load_state_dict(torch.load(Config.CHILD_FT_PATH, map_location=device))
         child_ft.eval()
 
-    scratch_baseline = None
+    same_arch_baseline = None
     if os.path.exists(Config.BASELINE_PATH):
         ensure_metadata_compatibility(
             checkpoint_metadata_path(Config.BASELINE_PATH),
             {
                 **runtime_dataset_metadata(),
-                "artifact": "scratch_baseline_checkpoint",
+                "artifact": "same_arch_baseline_checkpoint",
+                **baseline_metadata(),
             },
-            "Scratch baseline checkpoint",
+            "Same-architecture baseline checkpoint",
         )
-        scratch_baseline = MyModel(Config.BASELINE).to(device)
-        scratch_baseline.load_state_dict(torch.load(Config.BASELINE_PATH, map_location=device))
-        scratch_baseline.eval()
+        same_arch_baseline = ScratchChildModel(Config.PARENT, Config.BASELINE).to(device)
+        try:
+            same_arch_baseline.load_state_dict(torch.load(Config.BASELINE_PATH, map_location=device))
+        except RuntimeError as e:
+            raise RuntimeError(
+                "The saved same-architecture baseline checkpoint does not match the current 32M child config. "
+                "Re-run `python experiment.py --mode baseline` (or `--mode standard32m`)."
+            ) from e
+        same_arch_baseline.eval()
 
     print(f"Parent model : {parent.count_params():.1f}M")
     print(f"Child (spawn): {child_spawn.count_params():.1f}M")
     if child_ft: print(f"Child (FT)   : {child_ft.count_params():.1f}M")
-    if scratch_baseline: print(f"Scratch 32M  : {scratch_baseline.count_params():.1f}M")
+    if same_arch_baseline: print(f"Scratch same-arch: {same_arch_baseline.count_params():.1f}M")
 
     results = {}
     for split in ["valid", "test"]:
@@ -1240,12 +1355,12 @@ def run_eval(data_cache):
             print(f"    Child (FT)    : {ft_ppl:.2f}  "
                   f"({'improved' if d2>0 else 'worse'} vs parent: {abs(d2):.2f})")
             print(f"    spawn->FT delta: {d3:.2f}")
-        if scratch_baseline:
-            sb_ppl = compute_perplexity(scratch_baseline, data_cache[split], device)
-            row["scratch_baseline_ppl"] = round(sb_ppl,2)
+        if same_arch_baseline:
+            sb_ppl = compute_perplexity(same_arch_baseline, data_cache[split], device)
+            row["same_arch_baseline_ppl"] = round(sb_ppl,2)
             d4 = (ft_ppl - sb_ppl) if child_ft else (cs_ppl - sb_ppl)
             ref_label = "child FT" if child_ft else "child spawn"
-            print(f"    Scratch 32M   : {sb_ppl:.2f}  "
+            print(f"    Scratch same-arch: {sb_ppl:.2f}  "
                   f"({'better' if d4>0 else 'worse'} than {ref_label}: {abs(d4):.2f})")
         results[split] = row
 
@@ -1403,11 +1518,11 @@ def plot_validation_ppl_over_epochs(results_dir, out_name):
         series.append(("Child (spawn+FT)", child_epochs, child_vals, "#16a34a"))
 
     scratch_epochs, scratch_vals = load_epoch_series(
-        epoch_csv=os.path.join(results_dir, "scratch_baseline_epoch_metrics.csv"),
-        step_csv=os.path.join(results_dir, "scratch_baseline_log.csv"),
+        epoch_csv=os.path.join(results_dir, "same_arch_baseline_epoch_metrics.csv"),
+        step_csv=os.path.join(results_dir, "same_arch_baseline_log.csv"),
     )
     if scratch_epochs:
-        series.append(("Scratch baseline (~32.1M)", scratch_epochs, scratch_vals, "#ef4444"))
+        series.append((baseline_model_label(), scratch_epochs, scratch_vals, "#ef4444"))
 
     if not series:
         return False
@@ -1505,7 +1620,7 @@ def run_plot():
     for fname, title, color in [
         ("pretrain_log.csv","Parent Model Pre-training Loss Curve","#2563eb"),
         ("finetune_log.csv","Child Model Fine-tuning Loss Curve",  "#16a34a"),
-        ("scratch_baseline_log.csv","Scratch Baseline Training Loss Curve", "#ef4444"),
+        ("same_arch_baseline_log.csv","Same-Architecture Scratch Baseline Training Loss Curve", "#ef4444"),
     ]:
         path = os.path.join(rd, fname)
         if not os.path.exists(path): continue
@@ -1531,7 +1646,7 @@ def run_plot():
                 ("Parent", "parent_ppl", "#3b82f6"),
                 ("Child (spawn only)", "child_spawn_ppl", "#f97316"),
                 ("Child (spawn+FT)", "child_ft_ppl", "#16a34a"),
-                ("Scratch baseline (~32.1M)", "scratch_baseline_ppl", "#ef4444"),
+                (baseline_model_label(), "same_arch_baseline_ppl", "#ef4444"),
             ],
         )
         print("  Saved: perplexity_comparison.png")
@@ -1596,7 +1711,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode",
         choices=["menu","parent_to_child","child_to_child","quit",
-                 "data","pretrain","cache","spawn","finetune","baseline","eval","plot","all",
+                 "data","pretrain","cache","spawn","finetune","baseline","standard32m","eval","plot","all",
                  "next_cache","next_spawn","next_finetune","next_eval","next_plot","next_all"],
         default="menu")
     parser.add_argument("--child-multiplier",
@@ -1622,7 +1737,7 @@ if __name__ == "__main__":
     if mode in ("cache","all"):    run_cache(data_cache)
     if mode in ("spawn","all"):    run_spawn()
     if mode in ("finetune","all"): run_finetune(data_cache)
-    if mode == "baseline":         run_scratch_baseline(data_cache)
+    if mode == "baseline":         run_standard_baseline(data_cache)
     if mode in ("eval","all"):     run_eval(data_cache)
     if mode in ("plot","all"):     run_plot()
     if mode in ("next_cache","next_all"):    run_next_cache(data_cache)

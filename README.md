@@ -88,6 +88,8 @@ python experiment.py --mode cache
 python experiment.py --mode spawn
 python experiment.py --mode finetune
 python experiment.py --mode baseline
+# alias for the same-architecture scratch baseline
+python experiment.py --mode standard32m
 python experiment.py --mode eval
 python experiment.py --mode plot
 
@@ -110,17 +112,19 @@ What would you like to build?
 
 `child_to_child` now uses the previously created child model as the teacher model and builds a next child into separate cache, checkpoint, and result files.
 
-To generate the strongest comparison figures for the first generation, run the scratch baseline once before `eval` and `plot`:
+To compare Growth Model against a normally trained model with the same architecture as the grown child, run the same-architecture scratch baseline once before `eval` and `plot`:
 
 ```bash
-python experiment.py --mode baseline
+python experiment.py --mode standard32m
 python experiment.py --mode eval
 python experiment.py --mode plot
 ```
 
+This baseline uses the same `LayerGrowthModel` structure as the child model: interface width `256`, internal width `512`, `6` layers, and random initialization. It is then trained end-to-end for the same `3` epochs as the child fine-tuning stage, but without cache generation or spawn.
+
 Additional figure outputs now include:
 
-- `perplexity_comparison.png` with the optional scratch baseline bar when available
+- `perplexity_comparison.png` with the optional same-architecture baseline bar when available
 - `validation_ppl_by_epoch.png` for epoch-by-epoch validation PPL
 - `spawn_loss_by_layer.png` for per-layer spawn convergence
 
@@ -145,6 +149,7 @@ Default configs:
 |---|---|---|---|
 | Small (parent) | 256 | 6 | ~17M |
 | Medium (child) | 512 | 6 | ~32M |
+| Same-architecture scratch baseline | interface 256 / internal 512 | 6 | ~32.1M |
 | Large | 1024 | 16 | ~350M |
 | XL | 2048 | 24 | ~1.3B |
 
