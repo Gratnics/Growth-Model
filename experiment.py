@@ -114,10 +114,58 @@ def compute_perplexity(model, token_ids, device):
 
 def save_csv(path, rows):
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    if not rows:
+        print(f"  Skipped empty CSV: {path}")
+        return
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=rows[0].keys())
         w.writeheader(); w.writerows(rows)
     print(f"  Saved: {path}")
+
+
+def runtime_dataset_metadata():
+    return {
+        "dataset_name": Config.DATASET_NAME,
+        "dataset_prefix": Config.DATASET_PREFIX,
+        "seq_len": Config.SEQ_LEN,
+    }
+
+
+def checkpoint_metadata_path(path):
+    return f"{path}.metadata.json"
+
+
+def directory_metadata_path(path):
+    return os.path.join(path, "metadata.json")
+
+
+def save_metadata(path, metadata):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+    print(f"  Saved metadata: {path}")
+
+
+def load_metadata(path):
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def ensure_metadata_compatibility(path, expected, label):
+    metadata = load_metadata(path)
+    if metadata is None:
+        print(f"  Warning: {label} metadata not found at {path}; compatibility cannot be verified.")
+        return
+
+    mismatches = []
+    for key, expected_value in expected.items():
+        if metadata.get(key) != expected_value:
+            mismatches.append(f"{key}={metadata.get(key)!r} (expected {expected_value!r})")
+
+    if mismatches:
+        raise RuntimeError(f"{label} metadata mismatch: {', '.join(mismatches)}")
 
 
 def model_config_to_dict(config):
@@ -302,6 +350,15 @@ def layer_forward(model, layer_idx, x):
 
 
 def load_base_parent(device):
+    ensure_metadata_compatibility(
+        checkpoint_metadata_path(Config.PARENT_PATH),
+        {
+            **runtime_dataset_metadata(),
+            "artifact": "parent_checkpoint",
+            "model_config": model_config_to_dict(Config.PARENT),
+        },
+        "Parent checkpoint",
+    )
     parent = MyModel(Config.PARENT).to(device)
     parent.load_state_dict(torch.load(Config.PARENT_PATH, map_location=device))
     return parent
@@ -361,6 +418,18 @@ def run_cache_for_model(data_cache, teacher_model, cache_dir, label):
         total_mb += mb
         print(f"  Layer {l}: {mb:.0f}MB")
 
+    save_metadata(
+        directory_metadata_path(cache_dir),
+        {
+            **runtime_dataset_metadata(),
+            "artifact": "layer_cache",
+            "teacher_label": label,
+            "teacher_layers": n,
+            "teacher_interface_dim": teacher_model.tok_emb.weight.shape[1],
+            "cached_samples": len(dataset),
+            "cache_sample_cap": Config.CACHE_MAX_SAMPLES,
+        },
+    )
     print(f"\nTotal cache size: {total_mb:.0f}MB")
 
     del teacher_model
@@ -542,6 +611,14 @@ def run_pretrain(data_cache):
                 row["val_ppl"] = val_ppl
 
     torch.save(model.state_dict(), Config.PARENT_PATH)
+    save_metadata(
+        checkpoint_metadata_path(Config.PARENT_PATH),
+        {
+            **runtime_dataset_metadata(),
+            "artifact": "parent_checkpoint",
+            "model_config": model_config_to_dict(Config.PARENT),
+        },
+    )
     save_csv(os.path.join(Config.RESULTS_DIR, "pretrain_log.csv"), log_rows)
     save_csv(os.path.join(Config.RESULTS_DIR, "pretrain_epoch_metrics.csv"), epoch_rows)
     print(f"\nSaved parent model: {Config.PARENT_PATH}")
@@ -599,6 +676,18 @@ def build_spawn_modules_from_teacher(teacher_model, layer_idx, target_config, de
 
 def run_spawn_from_teacher(label, teacher_model, cache_dir, target_config, layer_dir, result_csv, step_result_csv):
     print("\n" + "="*55 + f"\n  Layer Spawn: {label}\n" + "="*55)
+
+    ensure_metadata_compatibility(
+        directory_metadata_path(cache_dir),
+        {
+            **runtime_dataset_metadata(),
+            "artifact": "layer_cache",
+            "teacher_label": label,
+            "teacher_layers": len(teacher_model.blocks),
+            "teacher_interface_dim": teacher_model.tok_emb.weight.shape[1],
+        },
+        f"{label} cache",
+    )
 
     for l in range(len(teacher_model.blocks)):
         if not os.path.exists(os.path.join(cache_dir, f"layer_{l}_input.pt")):
@@ -676,6 +765,16 @@ def run_spawn_from_teacher(label, teacher_model, cache_dir, target_config, layer
         del c_block, proj_up, proj_down, opt, cache_ds
         if torch.cuda.is_available(): torch.cuda.empty_cache()
 
+    save_metadata(
+        directory_metadata_path(layer_dir),
+        {
+            **runtime_dataset_metadata(),
+            "artifact": "spawned_layers",
+            "teacher_label": label,
+            "teacher_layers": len(teacher_model.blocks),
+            "target_config": model_config_to_dict(target_config),
+        },
+    )
     save_csv(os.path.join(Config.RESULTS_DIR, result_csv), spawn_log)
     save_csv(os.path.join(Config.RESULTS_DIR, step_result_csv), spawn_step_rows)
     print("\nLayer Spawn complete.")
@@ -690,6 +789,17 @@ class LayerGrowthModel(nn.Module):
         interface_dim = parent.tok_emb.weight.shape[1]
         internal_dim  = internal_config.d_model
         vocab_size = parent.tok_emb.weight.shape[0]
+
+        ensure_metadata_compatibility(
+            directory_metadata_path(layer_dir),
+            {
+                **runtime_dataset_metadata(),
+                "artifact": "spawned_layers",
+                "teacher_layers": len(parent.blocks),
+                "target_config": model_config_to_dict(internal_config),
+            },
+            f"Layer directory {layer_dir}",
+        )
 
         self.tok_emb  = nn.Embedding(vocab_size, interface_dim)
         with torch.no_grad():
@@ -751,6 +861,14 @@ def load_child_parent(device, require_finetuned=False):
     child_parent = ChildModel(base_parent).to(device)
 
     if os.path.exists(Config.CHILD_FT_PATH):
+        ensure_metadata_compatibility(
+            checkpoint_metadata_path(Config.CHILD_FT_PATH),
+            {
+                **runtime_dataset_metadata(),
+                "artifact": "child_finetuned_checkpoint",
+            },
+            "Child fine-tuned checkpoint",
+        )
         child_parent.load_state_dict(torch.load(Config.CHILD_FT_PATH, map_location=device))
         label = "Child parent (fine-tuned)"
     elif require_finetuned:
@@ -758,6 +876,7 @@ def load_child_parent(device, require_finetuned=False):
     else:
         label = "Child parent (spawn only)"
 
+    print(f"Using {label.lower()} as the teacher model.")
     child_parent.eval()
     return child_parent, label
 
@@ -773,6 +892,7 @@ def run_finetune_for_model(
     epoch_result_csv,
     epochs=Config.FINETUNE_EPOCHS,
     lr=Config.LR_FINETUNE,
+    checkpoint_artifact="finetuned_checkpoint",
 ):
     print("\n" + "="*55 + f"\n  Fine-tuning: {model_label}\n" + "="*55)
     device = Config.DEVICE
@@ -822,6 +942,14 @@ def run_finetune_for_model(
                 row["val_ppl"] = val_ppl
 
     torch.save(model.state_dict(), save_path)
+    save_metadata(
+        checkpoint_metadata_path(save_path),
+        {
+            **runtime_dataset_metadata(),
+            "artifact": checkpoint_artifact,
+            "model_label": model_label,
+        },
+    )
     save_csv(os.path.join(Config.RESULTS_DIR, result_csv), log_rows)
     save_csv(os.path.join(Config.RESULTS_DIR, epoch_result_csv), epoch_rows)
     print(f"\nSaved fine-tuned model: {save_path}")
@@ -837,6 +965,7 @@ def run_finetune(data_cache):
         save_path=Config.CHILD_FT_PATH,
         result_csv="finetune_log.csv",
         epoch_result_csv="finetune_epoch_metrics.csv",
+        checkpoint_artifact="child_finetuned_checkpoint",
     )
 
 
@@ -852,6 +981,7 @@ def run_scratch_baseline(data_cache):
         epoch_result_csv="scratch_baseline_epoch_metrics.csv",
         epochs=Config.BASELINE_EPOCHS,
         lr=Config.LR_FINETUNE,
+        checkpoint_artifact="scratch_baseline_checkpoint",
     )
 
 
@@ -903,6 +1033,7 @@ def run_next_finetune(data_cache):
         save_path=Config.NEXT_CHILD_FT_PATH,
         result_csv="next_finetune_log.csv",
         epoch_result_csv="next_finetune_epoch_metrics.csv",
+        checkpoint_artifact="next_child_finetuned_checkpoint",
     )
 
 
@@ -920,12 +1051,28 @@ def run_eval(data_cache):
 
     child_ft = None
     if os.path.exists(Config.CHILD_FT_PATH):
+        ensure_metadata_compatibility(
+            checkpoint_metadata_path(Config.CHILD_FT_PATH),
+            {
+                **runtime_dataset_metadata(),
+                "artifact": "child_finetuned_checkpoint",
+            },
+            "Child fine-tuned checkpoint",
+        )
         child_ft = ChildModel(parent).to(device)
         child_ft.load_state_dict(torch.load(Config.CHILD_FT_PATH, map_location=device))
         child_ft.eval()
 
     scratch_baseline = None
     if os.path.exists(Config.BASELINE_PATH):
+        ensure_metadata_compatibility(
+            checkpoint_metadata_path(Config.BASELINE_PATH),
+            {
+                **runtime_dataset_metadata(),
+                "artifact": "scratch_baseline_checkpoint",
+            },
+            "Scratch baseline checkpoint",
+        )
         scratch_baseline = MyModel(Config.BASELINE).to(device)
         scratch_baseline.load_state_dict(torch.load(Config.BASELINE_PATH, map_location=device))
         scratch_baseline.eval()
@@ -989,6 +1136,14 @@ def run_next_eval(data_cache):
 
     next_ft = None
     if os.path.exists(Config.NEXT_CHILD_FT_PATH):
+        ensure_metadata_compatibility(
+            checkpoint_metadata_path(Config.NEXT_CHILD_FT_PATH),
+            {
+                **runtime_dataset_metadata(),
+                "artifact": "next_child_finetuned_checkpoint",
+            },
+            "Next child fine-tuned checkpoint",
+        )
         next_ft = NextChildModel(child_parent).to(device)
         next_ft.load_state_dict(torch.load(Config.NEXT_CHILD_FT_PATH, map_location=device))
         next_ft.eval()
