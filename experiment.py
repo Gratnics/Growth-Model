@@ -11,7 +11,7 @@ class Config:
     PARENT = ModelConfig(vocab_size=50257, max_seq_len=256, d_model=256,
                          n_layers=6, n_heads=8, n_kv_heads=4,
                          ffn_mult=4, dropout=0.1, bias=False)
-    CHILD  = ModelConfig(vocab_size=50257, max_seq_len=256, d_model=512,
+    CHILD  = ModelConfig(vocab_size=50257, max_seq_len=256, d_model=640,
                          n_layers=6, n_heads=16, n_kv_heads=8,
                          ffn_mult=4, dropout=0.0, bias=False)
     PRETRAIN_EPOCHS = 3
@@ -79,6 +79,65 @@ def save_csv(path, rows):
         w = csv.DictWriter(f, fieldnames=rows[0].keys())
         w.writeheader(); w.writerows(rows)
     print(f"  Saved: {path}")
+
+
+WORKFLOW_MENU = {
+    "1": "parent_to_child",
+    "2": "child_to_child",
+    "3": "quit",
+    "parent_to_child": "parent_to_child",
+    "child_to_child": "child_to_child",
+    "quit": "quit",
+    "q": "quit",
+}
+
+
+def print_banner():
+    print("\nGrowth Model - Validation Experiment (Revised)")
+    print(f"  Device   : {Config.DEVICE}")
+    if torch.cuda.is_available():
+        print(f"  GPU      : {torch.cuda.get_device_name(0)}")
+        print(f"  VRAM     : {torch.cuda.get_device_properties(0).total_memory/1024**3:.1f} GB")
+    print(f"  Parent   : d_model={Config.PARENT.d_model}, n_layers={Config.PARENT.n_layers}")
+    print(f"  Child    : d_model={Config.CHILD.d_model},  n_layers={Config.CHILD.n_layers}")
+
+
+def select_start_mode():
+    print("\nWhat would you like to build?")
+    print("  1. Build the foundation from a parent model to a child model")
+    print("  2. Build a child model using an existing child model as the parent")
+    print("  3. Quit")
+    while True:
+        try:
+            choice = input("\nSelect an option [1-3]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nNo selection received. Exiting.")
+            return "quit"
+        mode = WORKFLOW_MENU.get(choice)
+        if mode:
+            return mode
+        print("Invalid selection. Please enter 1, 2, or 3.")
+
+
+def resolve_mode(mode):
+    if mode == "menu":
+        return select_start_mode()
+    return mode
+
+
+def handle_workflow_mode(mode):
+    if mode == "quit":
+        print("\nExiting without running the experiment.")
+        return True, None
+    if mode == "parent_to_child":
+        print("\nSelected workflow: parent model -> child model")
+        return False, "all"
+    if mode == "child_to_child":
+        print("\nSelected workflow: child model -> child model")
+        print("This workflow is not implemented yet in the current codebase.")
+        print("The current pipeline only supports MyModel(Config.PARENT) as the teacher model.")
+        return True, None
+    return False, mode
 
 
 # Data prep
@@ -541,29 +600,28 @@ def run_plot():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode",
-        choices=["data","pretrain","cache","spawn","finetune","eval","plot","all"],
-        default="all")
+        choices=["menu","parent_to_child","child_to_child","quit",
+                 "data","pretrain","cache","spawn","finetune","eval","plot","all"],
+        default="menu")
     args = parser.parse_args()
 
-    print("\nGrowth Model - Validation Experiment (Revised)")
-    print(f"  Device   : {Config.DEVICE}")
-    if torch.cuda.is_available():
-        print(f"  GPU      : {torch.cuda.get_device_name(0)}")
-        print(f"  VRAM     : {torch.cuda.get_device_properties(0).total_memory/1024**3:.1f} GB")
-    print(f"  Parent   : d_model={Config.PARENT.d_model}, n_layers={Config.PARENT.n_layers}")
-    print(f"  Child    : d_model={Config.CHILD.d_model},  n_layers={Config.CHILD.n_layers}")
+    print_banner()
+    mode = resolve_mode(args.mode)
+    should_exit, mode = handle_workflow_mode(mode)
+    if should_exit:
+        raise SystemExit(0)
 
     os.makedirs(Config.RESULTS_DIR, exist_ok=True)
 
     needs_data = {"data","pretrain","cache","spawn","finetune","eval","all"}
-    if args.mode in needs_data:
+    if mode in needs_data:
         data_cache = prepare_data()
 
-    if args.mode in ("pretrain","all"): run_pretrain(data_cache)
-    if args.mode in ("cache","all"):    run_cache(data_cache)
-    if args.mode in ("spawn","all"):    run_spawn()
-    if args.mode in ("finetune","all"): run_finetune(data_cache)
-    if args.mode in ("eval","all"):     run_eval(data_cache)
-    if args.mode in ("plot","all"):     run_plot()
+    if mode in ("pretrain","all"): run_pretrain(data_cache)
+    if mode in ("cache","all"):    run_cache(data_cache)
+    if mode in ("spawn","all"):    run_spawn()
+    if mode in ("finetune","all"): run_finetune(data_cache)
+    if mode in ("eval","all"):     run_eval(data_cache)
+    if mode in ("plot","all"):     run_plot()
 
     print("\nDone. Check the results/ folder.")

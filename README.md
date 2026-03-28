@@ -10,7 +10,7 @@
 
 Growth Model is a method for building a larger language model from a smaller pre-trained one, without ever training the whole thing at once.
 
-The idea: instead of expanding the full model in one shot, we train one new layer at a time. Each new layer learns from the corresponding layer of the parent model, using pre-cached activations as training data. This means the parent model never needs to be in GPU memory during the spawn phase — only one child layer and two small projection layers sit on the GPU at any given time.
+The idea: instead of expanding the full model in one shot, we train one new layer at a time. Each new layer learns from the corresponding layer of the parent model, using pre-cached activations as training data. This means the parent model never needs to be in GPU memory during the spawn phase - only one child layer and two small projection layers sit on the GPU at any given time.
 
 The result in our experiment: **97% GPU memory reduction** during layer spawning (187 MB vs 5,950 MB), and a child model that outperforms its parent after a short fine-tuning pass.
 
@@ -21,8 +21,8 @@ The result in our experiment: **97% GPU memory reduction** during layer spawning
 | Model | Params | Valid PPL | Test PPL |
 |---|---|---|---|
 | Parent (pre-trained) | 17.3M | 118.76 | 103.31 |
-| Child — spawn only | 32.1M | 196.00 | 173.36 |
-| **Child — spawn + fine-tune** | **32.1M** | **95.83** | **84.80** |
+| Child - spawn only | 32.1M | 196.00 | 173.36 |
+| **Child - spawn + fine-tune** | **32.1M** | **95.83** | **84.80** |
 
 Hardware: single NVIDIA RTX 5070 (12 GB VRAM).
 
@@ -30,11 +30,11 @@ Hardware: single NVIDIA RTX 5070 (12 GB VRAM).
 
 ## How it works
 
-```
+```text
 Stage 1: Pre-train a small parent model M_p
 Stage 2: Cache all layer activations to disk (run M_p once)
 Stage 3: Spawn child layers one at a time
-          → only ~187 MB GPU memory per layer
+          - only ~187 MB GPU memory per layer
 Stage 4: Assemble the child model M_c
 Stage 5: Short end-to-end fine-tuning to fix inter-layer coherence
 ```
@@ -45,15 +45,15 @@ The key insight is that once the parent's activations are cached, the parent mod
 
 ## Files
 
-```
+```text
 my_model.py            Transformer architecture (from scratch)
-                       RMSNorm, RoPE, GQA, SwiGLU — no external model libs
+                       RMSNorm, RoPE, GQA, SwiGLU - no external model libs
 
 layer_spawn_custom.py  Layer Spawn implementation
                        Weight expansion + layer-wise distillation
 
 experiment.py          Full experiment pipeline
-                       Pre-train → cache → spawn → fine-tune → eval → plot
+                       Pre-train -> cache -> spawn -> fine-tune -> eval -> plot
 ```
 
 ---
@@ -63,10 +63,16 @@ experiment.py          Full experiment pipeline
 ```bash
 pip install torch transformers matplotlib
 
-# Run everything (pre-train → spawn → fine-tune → eval → plot)
-python experiment.py --mode all
+# Start with the menu
+python experiment.py
 
-# Or step by step
+# Run the full parent -> child pipeline directly
+python experiment.py --mode parent_to_child
+
+# Reserved workflow for child -> child growth
+python experiment.py --mode child_to_child
+
+# Or run step by step
 python experiment.py --mode pretrain
 python experiment.py --mode cache
 python experiment.py --mode spawn
@@ -75,18 +81,29 @@ python experiment.py --mode eval
 python experiment.py --mode plot
 ```
 
+Menu options:
+
+```text
+What would you like to build?
+  1. Build the foundation from a parent model to a child model
+  2. Build a child model using an existing child model as the parent
+  3. Quit
+```
+
+Note: `child_to_child` is currently a placeholder workflow. The current code still only supports `MyModel(Config.PARENT)` as the teacher model for cache generation and spawning.
+
 Results will appear in `results/` as CSV files and PNG graphs.
 
 ---
 
 ## Architecture
 
-Built from scratch — no Hugging Face model weights used.
+Built from scratch - no Hugging Face model weights used.
 
-- **RMSNorm** — faster than LayerNorm, used in LLaMA / Mistral
-- **RoPE** — rotary position embeddings (Su et al., 2024)
-- **Grouped Query Attention (GQA)** — fewer KV heads for memory efficiency
-- **SwiGLU FFN** — gated feed-forward, used in LLaMA / GPT-4
+- **RMSNorm** - faster than LayerNorm, used in LLaMA / Mistral
+- **RoPE** - rotary position embeddings (Su et al., 2024)
+- **Grouped Query Attention (GQA)** - fewer KV heads for memory efficiency
+- **SwiGLU FFN** - gated feed-forward, used in LLaMA / GPT-4
 
 Default configs:
 
@@ -102,8 +119,8 @@ Default configs:
 ## Limitations
 
 - Caching activations to disk is storage-heavy (~28 GB for 6 layers in this experiment)
-- End-to-end fine-tuning after assembly is required — spawn-only is worse than the parent
-- Only tested at small scale (17M → 32M). Larger scales are untested.
+- End-to-end fine-tuning after assembly is required - spawn-only is worse than the parent
+- Only tested at small scale (17M -> 32M). Larger scales are untested.
 
 ---
 
