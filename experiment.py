@@ -1,4 +1,4 @@
-import os, csv, time, math, json, argparse, urllib.request, sys, zipfile
+import os, csv, time, math, json, argparse, urllib.request, urllib.parse, shutil, sys, zipfile
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,11 +8,20 @@ from layer_spawn_custom import LayerExpander
 
 
 class Config:
-    DATASET_NAME = "WikiText-103"
-    DATASET_PREFIX = "wikitext103"
-    DATASET_ARCHIVE_URL = "https://s3.amazonaws.com/research.metamind.io/wikitext/wikitext-103-v1.zip"
-    DATASET_ARCHIVE_NAME = "wikitext-103-v1.zip"
-    DATASET_EXTRACT_DIR = "wikitext-103"
+    DATASET_NAME = "WikiText-2"
+    DATASET_PREFIX = "wikitext2"
+    DATASET_SOURCE = os.environ.get("GROWTHMODEL_DATASET_SOURCE", "huggingface").strip().lower()
+    HF_DATASET_REPO = "Salesforce/wikitext"
+    HF_DATASET_CONFIG = "wikitext-2-v1"
+    HF_CACHE_DIR = "./data/hf_cache"
+    HF_SPLIT_MAP = {
+        "train": "train",
+        "valid": "validation",
+        "test": "test",
+    }
+    DATASET_ARCHIVE_URL = "https://s3.amazonaws.com/research.metamind.io/wikitext/wikitext-2-v1.zip"
+    DATASET_ARCHIVE_NAME = "wikitext-2-v1.zip"
+    DATASET_EXTRACT_DIR = "wikitext-2"
     DATASET_SPLIT_FILES = {
         "train": "wiki.train.tokens",
         "valid": "wiki.valid.tokens",
@@ -506,13 +515,109 @@ def tokenize_file(path):
     print(f"  {os.path.basename(path)}: {len(ids):,} tokens")
     return ids
 
-def ensure_dataset_split_paths():
-    archive_path = os.path.join(Config.DATA_DIR, Config.DATASET_ARCHIVE_NAME)
+
+def iter_dataset_archive_urls():
+    override_url = (
+        os.environ.get("GROWTHMODEL_WIKITEXT_URL", "").strip()
+        or os.environ.get("GROWTHMODEL_WIKITEXT2_URL", "").strip()
+        or os.environ.get("GROWTHMODEL_WIKITEXT103_URL", "").strip()
+    )
+    if override_url:
+        yield override_url
+    yield Config.DATASET_ARCHIVE_URL
+
+
+def download_file(url, destination, max_redirects=5):
+    opener = urllib.request.build_opener()
+    current_url = url
+    headers = {"User-Agent": "GrowthModel/1.0"}
+
+    for _ in range(max_redirects + 1):
+        request = urllib.request.Request(current_url, headers=headers)
+        try:
+            with opener.open(request, timeout=120) as response:
+                resolved_url = response.geturl()
+                if resolved_url != current_url:
+                    print(f"  Redirected to: {resolved_url}")
+
+                temp_path = f"{destination}.part"
+                try:
+                    with open(temp_path, "wb") as f:
+                        shutil.copyfileobj(response, f)
+                    os.replace(temp_path, destination)
+                finally:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                return
+        except urllib.error.HTTPError as e:
+            if e.code in (301, 302, 303, 307, 308):
+                location = e.headers.get("Location")
+                if not location:
+                    raise
+                current_url = urllib.parse.urljoin(current_url, location)
+                print(f"  Redirected to: {current_url}")
+                continue
+            raise
+
+    raise RuntimeError(f"Too many redirects while downloading {url}")
+
+
+def dataset_split_paths():
     extract_root = os.path.join(Config.DATA_DIR, Config.DATASET_EXTRACT_DIR)
-    split_paths = {
+    return {
         split: os.path.join(extract_root, filename)
         for split, filename in Config.DATASET_SPLIT_FILES.items()
     }
+
+
+def ensure_huggingface_split_paths():
+    try:
+        from datasets import load_dataset
+    except ImportError as e:
+        raise RuntimeError(
+            "Hugging Face dataset loading requires the `datasets` package."
+        ) from e
+
+    split_paths = dataset_split_paths()
+    missing_splits = [split for split, path in split_paths.items() if not os.path.exists(path)]
+    if not missing_splits:
+        return split_paths
+
+    extract_root = os.path.join(Config.DATA_DIR, Config.DATASET_EXTRACT_DIR)
+    os.makedirs(extract_root, exist_ok=True)
+
+    print(f"  Source type: Hugging Face ({Config.HF_DATASET_REPO} / {Config.HF_DATASET_CONFIG})")
+    for split in missing_splits:
+        hf_split = Config.HF_SPLIT_MAP[split]
+        path = split_paths[split]
+        temp_path = f"{path}.part"
+        print(f"  Downloading split: {split} ({hf_split})")
+        dataset = load_dataset(
+            Config.HF_DATASET_REPO,
+            Config.HF_DATASET_CONFIG,
+            split=hf_split,
+            cache_dir=Config.HF_CACHE_DIR,
+        )
+
+        try:
+            with open(temp_path, "w", encoding="utf-8", newline="\n") as f:
+                for idx, row in enumerate(dataset):
+                    f.write(row["text"])
+                    f.write("\n")
+                    if idx and idx % 250000 == 0:
+                        print(f"    Wrote {idx:,} rows...")
+            os.replace(temp_path, path)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        print(f"  Saved: {path}")
+
+    return split_paths
+
+
+def ensure_legacy_zip_split_paths():
+    archive_path = os.path.join(Config.DATA_DIR, Config.DATASET_ARCHIVE_NAME)
+    split_paths = dataset_split_paths()
 
     missing_splits = [split for split, path in split_paths.items() if not os.path.exists(path)]
     if not missing_splits:
@@ -520,7 +625,22 @@ def ensure_dataset_split_paths():
 
     if not os.path.exists(archive_path):
         print(f"  Downloading archive: {Config.DATASET_ARCHIVE_NAME}...")
-        urllib.request.urlretrieve(Config.DATASET_ARCHIVE_URL, archive_path)
+        last_error = None
+        for url in iter_dataset_archive_urls():
+            try:
+                print(f"  Source: {url}")
+                download_file(url, archive_path)
+                last_error = None
+                break
+            except Exception as e:
+                last_error = e
+                print(f"  Download failed: {e}")
+        if last_error is not None:
+            raise RuntimeError(
+                f"Unable to download {Config.DATASET_NAME}. "
+                f"Place {Config.DATASET_ARCHIVE_NAME} in {Config.DATA_DIR} "
+                "or set GROWTHMODEL_WIKITEXT_URL to a working mirror."
+            ) from last_error
     else:
         print(f"  Using existing archive: {archive_path}")
 
@@ -534,6 +654,27 @@ def ensure_dataset_split_paths():
             archive.extract(member, Config.DATA_DIR)
 
     return split_paths
+
+
+def ensure_dataset_split_paths():
+    source = Config.DATASET_SOURCE
+
+    if source in {"huggingface", "hf"}:
+        return ensure_huggingface_split_paths()
+    if source in {"legacy_zip", "zip"}:
+        return ensure_legacy_zip_split_paths()
+    if source == "auto":
+        try:
+            return ensure_huggingface_split_paths()
+        except Exception as hf_error:
+            print(f"  Hugging Face source failed: {hf_error}")
+            print("  Falling back to legacy zip source.")
+            return ensure_legacy_zip_split_paths()
+
+    raise ValueError(
+        f"Unsupported dataset source: {Config.DATASET_SOURCE}. "
+        "Use `huggingface`, `legacy_zip`, or `auto`."
+    )
 
 def prepare_data():
     print("\n" + "="*55 + f"\n  Data Preparation ({Config.DATASET_NAME})\n" + "="*55)

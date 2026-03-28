@@ -26,9 +26,12 @@ The result in our experiment: **97% GPU memory reduction** during layer spawning
 
 Hardware: single NVIDIA RTX 5070 (12 GB VRAM).
 
-Current default dataset in the codebase: **WikiText-103**.
+Current default dataset in the codebase: **WikiText-2**.
+Default source: **Hugging Face `Salesforce/wikitext` (`wikitext-2-v1`)**.
 
-Layer-cache distillation now defaults to the first **20,000** training sequences so WikiText-103 stays practical on a single workstation.
+Layer-cache distillation uses up to the first **20,000** training sequences by default.
+
+If needed, you can switch dataset source with `GROWTHMODEL_DATASET_SOURCE=legacy_zip` or `GROWTHMODEL_DATASET_SOURCE=auto`.
 
 ---
 
