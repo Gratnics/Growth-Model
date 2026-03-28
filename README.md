@@ -2,7 +2,7 @@
 
 > Growing language models one layer at a time.
 
-**Date:** March 26, 2026
+**Date:** March 28, 2026
 
 ---
 
