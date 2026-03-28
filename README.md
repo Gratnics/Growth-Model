@@ -16,7 +16,7 @@ The result in our experiment: **97% GPU memory reduction** during layer spawning
 
 ---
 
-## Results (WikiText-2)
+## Historical Results (WikiText-2)
 
 | Model | Params | Valid PPL | Test PPL |
 |---|---|---|---|
@@ -25,6 +25,10 @@ The result in our experiment: **97% GPU memory reduction** during layer spawning
 | **Child - spawn + fine-tune** | **32.1M** | **95.83** | **84.80** |
 
 Hardware: single NVIDIA RTX 5070 (12 GB VRAM).
+
+Current default dataset in the codebase: **WikiText-103**.
+
+Layer-cache distillation now defaults to the first **20,000** training sequences so WikiText-103 stays practical on a single workstation.
 
 ---
 
@@ -69,7 +73,10 @@ python experiment.py
 # Run the full parent -> child pipeline directly
 python experiment.py --mode parent_to_child
 
-# Reserved workflow for child -> child growth
+# Set the child size explicitly from the command line
+python experiment.py --mode all --child-multiplier 1.85
+
+# Run the child -> child pipeline directly
 python experiment.py --mode child_to_child
 
 # Or run step by step
@@ -77,8 +84,16 @@ python experiment.py --mode pretrain
 python experiment.py --mode cache
 python experiment.py --mode spawn
 python experiment.py --mode finetune
+python experiment.py --mode baseline
 python experiment.py --mode eval
 python experiment.py --mode plot
+
+# Second-generation steps
+python experiment.py --mode next_cache
+python experiment.py --mode next_spawn
+python experiment.py --mode next_finetune
+python experiment.py --mode next_eval
+python experiment.py --mode next_plot
 ```
 
 Menu options:
@@ -90,7 +105,23 @@ What would you like to build?
   3. Quit
 ```
 
-Note: `child_to_child` is currently a placeholder workflow. The current code still only supports `MyModel(Config.PARENT)` as the teacher model for cache generation and spawning.
+`child_to_child` now uses the previously created child model as the teacher model and builds a next child into separate cache, checkpoint, and result files.
+
+To generate the strongest comparison figures for the first generation, run the scratch baseline once before `eval` and `plot`:
+
+```bash
+python experiment.py --mode baseline
+python experiment.py --mode eval
+python experiment.py --mode plot
+```
+
+Additional figure outputs now include:
+
+- `perplexity_comparison.png` with the optional scratch baseline bar when available
+- `validation_ppl_by_epoch.png` for epoch-by-epoch validation PPL
+- `spawn_loss_by_layer.png` for per-layer spawn convergence
+
+When you start the first-generation `all` pipeline interactively, the script can also ask how large the child model should be relative to the parent. The chosen child config is saved and reused by later `spawn`, `finetune`, `eval`, and `child_to_child` runs.
 
 Results will appear in `results/` as CSV files and PNG graphs.
 

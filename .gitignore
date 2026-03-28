@@ -14,6 +14,7 @@ data/
 results/
 checkpoints/
 cache/
+cache_next_child/
 
 # OS / editor
 .DS_Store
